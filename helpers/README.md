@@ -22,8 +22,25 @@
   環境ごとに設定ファイルを分ければ、1つのヘルパで複数環境を切り替えられる。
 
 ### 「必ず外から指定させる」パラメータ
-`REQUIRED_EXTERNAL=(mode prefix)` に列挙。未指定なら usage を表示して終了する。
-毎回同じ prefix でよいなら `prefix` を外し `CFG_DEFAULT_PREFIX` を使う。
+`REQUIRED_EXTERNAL=(mode)` に列挙。未指定なら usage を表示して終了する。
+毎回 `prefix` も明示させたい場合は `REQUIRED_EXTERNAL` に `prefix` を加える。
+
+### `--prefix` を省略したとき(削除対象候補の一覧表示)
+`--prefix` は必須ではない。省略した場合、本体は起動せず、ヘルパ自身が
+バケットルート直下を一覧し、削除対象となる候補を表示して終了する(削除は行わない)。
+
+- `--mode directory`: 直下のサブディレクトリ(`CommonPrefixes`)+ 空ディレクトリ表現
+- `--mode file`: 直下のファイル(末尾 `/` を除くキー)
+
+```bash
+# バケットルート直下の候補を確認 → 表示された候補から --prefix を選んで再実行
+./helpers/s3_delete_helper.sh --mode directory
+./helpers/s3_delete_helper.sh --mode directory --prefix work/
+```
+
+一覧取得には `aws` CLI と `jq` が必要(プロファイル/リージョンは `CFG_PROFILE` /
+`CFG_REGION` を使用)。毎回同じ prefix でよい場合は `CFG_DEFAULT_PREFIX` を設定すると、
+候補一覧ではなくその既定 prefix で本体を実行する。
 
 ### 本体へ直接引数を渡したいとき
 `--` 以降はそのまま本体へ渡る:
