@@ -107,12 +107,17 @@ CFG_LOG_FILE=""                            # 例: "/var/log/s3_delete/helper.log
 #==============================================================================
 # 「外から必ず指定させる」パラメータの定義
 #   - ここに列挙したものは、コマンドラインでの指定が無いと usage を出して終了する。
-#   - 既定は mode と prefix(実行のたびに変わり、安全上も明示させたい)。
-#   - prefix を毎回同じにしたい等で必須から外す場合は "prefix" を削るだけでよい
-#     (その場合は下の CFG_DEFAULT_PREFIX を使う)。
+#   - 既定は mode のみ(実行のたびに変わり、安全上も明示させたい)。
+#   - prefix は必須ではない。--prefix を省略した場合は、バケットルート直下を
+#     一覧し、削除対象となる候補(directory モード=直下サブディレクトリ /
+#     file モード=直下ファイル)を表示して終了する(削除は行わない)。
+#     続けて削除する場合は、表示された候補から --prefix を指定して再実行する。
+#   - prefix を毎回明示させたい場合は "prefix" を REQUIRED_EXTERNAL に加える。
+#   - prefix を毎回同じ既定値にしたい場合は CFG_DEFAULT_PREFIX を設定する
+#     (この場合は候補一覧ではなく既定 prefix で本体を実行する)。
 #==============================================================================
-REQUIRED_EXTERNAL=(mode prefix)
-CFG_DEFAULT_PREFIX=""       # prefix を必須から外した場合の既定 prefix
+REQUIRED_EXTERNAL=(mode)
+CFG_DEFAULT_PREFIX=""       # 未指定時の既定 prefix(空なら候補一覧を表示する)
 
 #==============================================================================
 # =========================== 設定ここまで ===========================
@@ -134,7 +139,11 @@ PASSTHROUGH=()              # `--` 以降、本体へそのまま渡す追加引
 usage() {
     cat <<EOF
 使用方法:
-  ${HELPER_NAME} --mode <directory|file> --prefix <PREFIX> [オプション] [-- <本体へ渡す追加引数...>]
+  ${HELPER_NAME} --mode <directory|file> [--prefix <PREFIX>] [オプション] [-- <本体へ渡す追加引数...>]
+
+  --prefix を省略した場合は、バケットルート直下の削除対象候補を一覧表示して終了します
+  (削除は行いません)。表示された候補から --prefix を指定して再実行してください。
+  ※ CFG_DEFAULT_PREFIX を設定している場合は、候補一覧ではなく既定 prefix で本体を実行します。
 
 このヘルパは本体 s3_select_delete.sh を、環境固定パラメータを補いながら呼び出します。
 環境固定パラメータ(アカウントID/バケット/プロファイル/リージョン/スイッチバック等)は
@@ -165,6 +174,10 @@ $(printf '  %s\n' "${REQUIRED_EXTERNAL[@]/#/--}")
   CFG_LOG_FILE       : ${CFG_LOG_FILE:-(未設定)}
 
 例:
+  # prefix を省略 → バケットルート直下の削除対象候補を一覧表示(削除はしない)
+  ${HELPER_NAME} --mode directory
+  ${HELPER_NAME} --mode file
+
   # ディレクトリモード(環境固定値は CONFIG から補完)
   ${HELPER_NAME} --mode directory --prefix work/
 
@@ -310,6 +323,76 @@ build_main_args() {
 }
 
 #==============================================================================
+# バケットルート直下の削除対象候補を一覧表示
+#   - --prefix 未指定(かつ CFG_DEFAULT_PREFIX も空)のときに呼ばれる。
+#   - 本体を起動せず、ヘルパ自身が list-objects-v2 でバケットルート直下を一覧し、
+#     削除対象となり得る候補を表示して終了する(削除は一切行わない)。
+#   - MODE により表示内容を切り替える:
+#       directory → 直下のサブディレクトリ(CommonPrefixes)+ 空ディレクトリ表現
+#       file      → 直下のファイル(末尾 "/" を除くキー)
+#   - 認証情報/プロファイル/リージョンは CONFIG(CFG_*)を利用する。
+#==============================================================================
+list_bucket_root_candidates() {
+    command -v aws >/dev/null 2>&1 || die "aws コマンドが見つかりません(候補一覧には aws CLI が必要です)。"
+    command -v jq  >/dev/null 2>&1 || die "jq コマンドが見つかりません(候補一覧には jq が必要です)。"
+
+    local aws_opts=()
+    [[ -n "${CFG_PROFILE}" ]] && aws_opts+=(--profile "${CFG_PROFILE}")
+    [[ -n "${CFG_REGION}" ]]  && aws_opts+=(--region "${CFG_REGION}")
+    aws_opts+=(--output json)
+
+    printf '[INFO] --prefix 未指定のため、バケットルート直下の削除対象候補を一覧表示します(mode=%s, bucket=%s)。\n' \
+        "${OPT_MODE}" "${CFG_BUCKET}" >&2
+
+    local out_file err_file rc=0
+    out_file="$(mktemp "${TMPDIR:-/tmp}/s3helper_root.XXXXXX")" || die "一時ファイルを作成できませんでした。"
+    err_file="$(mktemp "${TMPDIR:-/tmp}/s3helper_err.XXXXXX")"  || die "一時ファイルを作成できませんでした。"
+
+    set +e
+    # Delimiter "/" で直下のみを対象にする(全ページ結合出力)
+    aws "${aws_opts[@]}" s3api list-objects-v2 \
+        --bucket "${CFG_BUCKET}" \
+        --delimiter "/" \
+        >"${out_file}" 2>"${err_file}"
+    rc=$?
+    set -e
+
+    if [[ "${rc}" -ne 0 ]]; then
+        printf '[ERROR] バケットルートの一覧取得に失敗しました(bucket=%s)。\n' "${CFG_BUCKET}" >&2
+        sed 's/^/[ERROR]   /' "${err_file}" >&2 2>/dev/null || true
+        rm -f "${out_file}" "${err_file}"
+        exit 1
+    fi
+
+    # MODE に応じて候補を抽出(改行区切り→mapfile で配列化)
+    local jq_filter
+    if [[ "${OPT_MODE}" == "file" ]]; then
+        jq_filter='(.Contents // []) | .[].Key | select(endswith("/") | not)'
+    else
+        jq_filter='((.CommonPrefixes // []) | .[].Prefix), ((.Contents // []) | .[].Key | select(endswith("/")))'
+    fi
+
+    local -a items=()
+    mapfile -t items < <(jq -r "${jq_filter}" "${out_file}")
+    rm -f "${out_file}" "${err_file}"
+
+    if [[ "${#items[@]}" -eq 0 ]]; then
+        printf '[INFO] バケットルート直下に %s モードの削除対象候補は見つかりませんでした。\n' "${OPT_MODE}" >&2
+        return 0
+    fi
+
+    {
+        printf '\n=== 削除対象候補(バケットルート直下 / %s モード)===\n' "${OPT_MODE}"
+        local i
+        for i in "${!items[@]}"; do
+            printf '  [%d] %s\n' "$((i + 1))" "${items[$i]}"
+        done
+        printf '\n上記はバケットルート直下の候補です。実際に削除するには --prefix で対象を指定して再実行してください。\n'
+        printf '例: %s --mode %s --prefix <上記のいずれか>\n' "${HELPER_NAME}" "${OPT_MODE}"
+    } >&2
+}
+
+#==============================================================================
 # メイン
 #==============================================================================
 main() {
@@ -317,6 +400,15 @@ main() {
     load_external_config
     validate_required_external
     validate_config
+
+    # --prefix 未指定 かつ 既定 prefix も空 → バケットルートの候補一覧を表示して終了。
+    #   （REQUIRED_EXTERNAL に "prefix" を含めている場合は、ここに来る前に
+    #     validate_required_external が usage を出して終了している。）
+    if [[ "${OPT_PREFIX_SET}" != "true" && -z "${OPT_PREFIX}" ]]; then
+        list_bucket_root_candidates
+        exit 0
+    fi
+
     build_main_args
 
     if [[ "${OPT_DEBUG}" == "true" ]]; then
